@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useEffect } from 'react';
+import React, { useState, useCallback, useEffect, useMemo } from 'react';
 import { 
   FileSpreadsheet, 
   Upload, 
@@ -19,8 +19,7 @@ import {
 } from 'lucide-react';
 import { SheetData, ExcelRow, ProcessedFile, ArchitectureModel, ArchitectureElement, RelationshipType, FileStructureAnalysis } from './types';
 import { analyzeArchitectureSplit, analyzeFileStructure } from './services/geminiService';
-
-declare const XLSX: any;
+import * as XLSX from 'xlsx';
 
 // Helper to generate IDs
 const generateId = () => Math.random().toString(36).substr(2, 9);
@@ -36,12 +35,12 @@ const App: React.FC = () => {
   const [fileData, setFileData] = useState<SheetData | null>(null);
   
   // AI Config
-  const [userGoal, setUserGoal] = useState('将数据拆分为“应用系统”和“应用模块”对象，并提取它们之间的“包含”和“关联”关系。');
+  // Updated default text to be clearly an example
+  const [userGoal, setUserGoal] = useState('【示例指令 - 请根据您的文件内容修改】\n将数据拆分为“业务域”、“一级业务分类”、“二级业务分类”对象，并提取它们之间的“包含”关系。');
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [isStructureAnalyzing, setIsStructureAnalyzing] = useState(false);
   
   // Data Model (Editable)
-  // FIXED: Initialize with empty arrays. Previous error was caused by referencing undefined variables here.
   const [archModel, setArchModel] = useState<ArchitectureModel>({ elements: [], relationships: [] });
   
   // Output
@@ -62,18 +61,18 @@ const App: React.FC = () => {
 
     const reader = new FileReader();
     reader.onload = async (evt) => {
-      const bstr = evt.target?.result;
-      const workbook = XLSX.read(bstr, { type: 'binary' });
-      setWb(workbook);
-      
-      // Perform Structure Analysis
-      setIsStructureAnalyzing(true);
       try {
+        const bstr = evt.target?.result;
+        const workbook = XLSX.read(bstr, { type: 'binary' });
+        setWb(workbook);
+        
+        // Perform Structure Analysis
+        setIsStructureAnalyzing(true);
+        
         // Create a preview of all sheets (first 20 rows)
         const sheetsPreview: Record<string, any[][]> = {};
         workbook.SheetNames.forEach((name: string) => {
             const sheet = workbook.Sheets[name];
-            // Get raw array of arrays
             const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, range: 0, defval: '' }).slice(0, 20);
             sheetsPreview[name] = rows as any[][];
         });
@@ -88,8 +87,8 @@ const App: React.FC = () => {
             explanation: analysis.explanation || ''
         });
       } catch (err) {
-          console.error(err);
-          alert("结构分析失败，请检查API Key或文件格式");
+          console.error("File processing error:", err);
+          alert("文件解析或AI分析失败，请检查文件格式或重试。");
       } finally {
           setIsStructureAnalyzing(false);
       }
@@ -101,48 +100,53 @@ const App: React.FC = () => {
   const parseDataFromStructure = useCallback(() => {
     if (!wb || !fileStructure) return null;
     
-    const ws = wb.Sheets[fileStructure.sheetName];
-    if (!ws) return null;
+    try {
+      const ws = wb.Sheets[fileStructure.sheetName];
+      if (!ws) return null;
 
-    // Convert 'auto' end row to undefined for XLSX
-    const endRow = fileStructure.dataEndRow === 'auto' ? undefined : Number(fileStructure.dataEndRow);
-    
-    // We need to parse headers manually from the specified row
-    // XLSX utils are 0-based for ranges. headerRow is 1-based.
-    const headerRowIdx = fileStructure.headerRow - 1;
-    
-    // Get full sheet data as array of arrays first to control parsing perfectly
-    const allRows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' }) as any[][];
-    
-    if (allRows.length <= headerRowIdx) return null;
+      const endRow = fileStructure.dataEndRow === 'auto' ? undefined : Number(fileStructure.dataEndRow);
+      
+      // We need to parse headers manually from the specified row
+      // XLSX utils are 0-based for ranges. headerRow is 1-based.
+      const headerRowIdx = Math.max(0, fileStructure.headerRow - 1);
+      
+      // Get full sheet data as array of arrays first to control parsing perfectly
+      const allRows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' }) as any[][];
+      
+      if (allRows.length <= headerRowIdx) return null;
 
-    const headers = allRows[headerRowIdx].map((h: any) => String(h).trim()).filter((h: any) => h);
-    
-    // Extract data rows
-    const startRowIdx = fileStructure.dataStartRow - 1;
-    const dataRows = allRows.slice(startRowIdx, endRow); // slice is end-exclusive, but endRow is 1-based index, so it works out to include up to that row index if we treat it as count? No.
-    // If user says End Row 100, they mean include row 100. Slice needs index 100 to exclude it?
-    // Let's rely on slice index. Index 0 is Row 1. Index 99 is Row 100. Slice(0, 100) gets 0..99.
-    
-    // Map array to objects based on headers
-    const mappedData: ExcelRow[] = dataRows.map((row: any[]) => {
-        const obj: ExcelRow = {};
-        headers.forEach((h: string, i: number) => {
-            // Find the column index in the row that matches the header index
-            // Note: The data row array might be sparse or offset if we just take it from slice
-            // Actually, sheet_to_json with header:1 gives sparse arrays.
-            // A safer way is to use XLSX range option.
-            obj[h] = row[i]; 
-        });
-        return obj;
-    });
+      const headers = allRows[headerRowIdx].map((h: any) => String(h).trim()).filter((h: any) => h);
+      
+      // Extract data rows
+      const startRowIdx = Math.max(0, fileStructure.dataStartRow - 1);
+      const dataRows = allRows.slice(startRowIdx, endRow); 
+      
+      // Map array to objects based on headers
+      const mappedData: ExcelRow[] = dataRows.map((row: any[]) => {
+          const obj: ExcelRow = {};
+          headers.forEach((h: string, i: number) => {
+              obj[h] = row[i]; 
+          });
+          return obj;
+      });
 
-    return {
-        name: fileStructure.sheetName,
-        headers,
-        data: mappedData
-    };
+      return {
+          name: fileStructure.sheetName,
+          headers,
+          data: mappedData
+      };
+    } catch (e) {
+      console.error("Error parsing data from structure:", e);
+      return null;
+    }
   }, [wb, fileStructure]);
+
+  // Memoize the preview data count to avoid parsing in render
+  const effectiveRecordCount = useMemo(() => {
+    if (!wb || !fileStructure) return '...';
+    const d = parseDataFromStructure();
+    return d ? d.data.length + ' 条' : '0 条';
+  }, [wb, fileStructure, parseDataFromStructure]);
 
   // Handle Architecture Analysis (Transition to Step 2)
   const handleAnalyzeArchitecture = async () => {
@@ -169,7 +173,7 @@ const App: React.FC = () => {
       setStep(2);
     } catch (error) {
       console.error("Architecture analysis failed", error);
-      alert("AI analysis failed. Please try again or check console for details.");
+      alert("AI分析失败，请重试或检查控制台日志。");
     } finally {
       setIsAnalyzing(false);
     }
@@ -320,10 +324,10 @@ const App: React.FC = () => {
       ...prev,
       relationships: [...prev.relationships, { 
         id: generateId(), 
-        name: '新关系', 
+        name: '包含', 
         sourceElement: prev.elements[0]?.name || '', 
         targetElement: prev.elements[0]?.name || '', 
-        attributeMapping: { '源端': '', '目标端': '' } 
+        attributeMapping: {} 
       }]
     }));
   };
@@ -339,87 +343,176 @@ const App: React.FC = () => {
   const executeTransformation = useCallback(() => {
     if (!fileData || !archModel) return;
 
-    // Create a new Workbook
-    const wb = XLSX.utils.book_new();
+    try {
+        const generatedFiles: ProcessedFile[] = [];
 
-    // --- 1. Generate "架构元素定义" Sheet ---
-    const defData = archModel.elements.flatMap(elem => {
-        return Object.entries(elem.attributeMapping).map(([src, target]) => ({
-            '架构元素名称[*]': elem.name,
-            '属性名称[*]': target,
-            '是否主键': src === elem.primaryKey ? '是' : '否'
-        }));
-    });
-    
-    if (defData.length > 0) {
-        const wsDef = XLSX.utils.json_to_sheet(defData);
-        XLSX.utils.book_append_sheet(wb, wsDef, "架构元素定义");
-    }
+        // Helper: Unique Sheet Names
+        const getUniqueSheetName = (name: string, usedSet: Set<string>) => {
+            let candidate = name.slice(0, 31);
+            let counter = 1;
+            while (usedSet.has(candidate)) {
+                const suffix = `_${counter}`;
+                candidate = name.slice(0, 31 - suffix.length) + suffix;
+                counter++;
+            }
+            usedSet.add(candidate);
+            return candidate;
+        };
 
-    // --- 2. Generate Element Instance Sheets ---
-    archModel.elements.forEach((elem) => {
-      // Find the target attribute name that corresponds to the PK source column
-      const pkTargetAttr = elem.attributeMapping[elem.primaryKey];
-      // If no valid PK mapping, just skip or use best effort (though validation should prevent this)
-      
-      const instances: ExcelRow[] = fileData.data.map((row: ExcelRow) => {
-        const inst: ExcelRow = {};
-        Object.entries(elem.attributeMapping).forEach(([srcCol, targetAttr]) => {
-          let headerName = targetAttr;
-          // If this source column is the primary key, append [主键] to the header
-          if (srcCol === elem.primaryKey) {
-             headerName = `${targetAttr}[主键]`;
+        // ==========================================
+        // FILE 1: Object Excel (对象数据.xlsx)
+        // ==========================================
+        const wbObj = XLSX.utils.book_new();
+        const objSheetNames = new Set<string>();
+
+        // 1.1 "架构元素定义"
+        const defData = archModel.elements.flatMap(elem => {
+            return Object.entries(elem.attributeMapping).map(([src, target]) => ({
+                '架构元素名称[*]': elem.name,
+                '属性名称[*]': target,
+                '是否主键': src === elem.primaryKey ? '是' : '否'
+            }));
+        });
+        
+        if (defData.length > 0) {
+            const wsDef = XLSX.utils.json_to_sheet(defData);
+            XLSX.utils.book_append_sheet(wbObj, wsDef, getUniqueSheetName("架构元素定义", objSheetNames));
+        }
+
+        // 1.2 Element Sheets
+        archModel.elements.forEach((elem) => {
+          const pkTargetAttr = elem.attributeMapping[elem.primaryKey];
+          const instances: ExcelRow[] = fileData.data.map((row: ExcelRow) => {
+            const inst: ExcelRow = {};
+            Object.entries(elem.attributeMapping).forEach(([srcCol, targetAttr]) => {
+              let headerName = targetAttr;
+              if (srcCol === elem.primaryKey) {
+                 headerName = `${targetAttr}[主键]`;
+              }
+              inst[String(headerName)] = (row as any)[String(srcCol)];
+            });
+            return inst;
+          });
+
+          const pkHeaderName = pkTargetAttr ? `${pkTargetAttr}[主键]` : '';
+          const validInstances = instances.filter(i => !pkHeaderName || i[pkHeaderName]);
+          
+          // Dedup
+          const uniqueInstances = Array.from(new Map(validInstances.map(item => [
+              pkHeaderName && item[pkHeaderName] ? item[pkHeaderName] : JSON.stringify(item), 
+              item
+          ])).values());
+
+          if (uniqueInstances.length > 0) {
+              const ws = XLSX.utils.json_to_sheet(uniqueInstances);
+              XLSX.utils.book_append_sheet(wbObj, ws, getUniqueSheetName(elem.name, objSheetNames));
           }
-          // Fix: Ensure we use string key for row access
-          inst[String(headerName)] = (row as any)[String(srcCol)];
         });
-        return inst;
-      });
 
-      // Construct the expected PK Header Name for filtering
-      const pkHeaderName = pkTargetAttr ? `${pkTargetAttr}[主键]` : '';
-
-      // Filter empty PKs and Deduplicate
-      const validInstances = instances.filter(i => !pkHeaderName || i[pkHeaderName]);
-      
-      // Dedup based on PK if available, otherwise just use JSON string
-      const uniqueInstances = Array.from(new Map(validInstances.map(item => [
-          pkHeaderName && item[pkHeaderName] ? item[pkHeaderName] : JSON.stringify(item), 
-          item
-      ])).values());
-
-      if (uniqueInstances.length > 0) {
-          const ws = XLSX.utils.json_to_sheet(uniqueInstances);
-          XLSX.utils.book_append_sheet(wb, ws, elem.name);
-      }
-    });
-
-    // --- 3. Generate Relationship Sheets (Optional but preserved) ---
-    // If relationships exist, we add them as well, though specific format wasn't requested for them.
-    archModel.relationships.forEach((rel) => {
-      const instances: ExcelRow[] = fileData.data.map((row: ExcelRow) => {
-        const inst: ExcelRow = {};
-        Object.entries(rel.attributeMapping).forEach(([srcCol, targetAttr]) => {
-          inst[String(targetAttr)] = (row as any)[String(srcCol)];
+        const wbObjOut = XLSX.write(wbObj, { bookType: 'xlsx', type: 'array' });
+        generatedFiles.push({
+            name: '对象数据.xlsx',
+            blob: new Blob([wbObjOut], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }),
+            preview: defData.slice(0, 10)
         });
-        return inst;
-      }).filter(inst => inst['源端'] && inst['目标端']);
 
-      if (instances.length > 0) {
-          const ws = XLSX.utils.json_to_sheet(instances);
-          XLSX.utils.book_append_sheet(wb, ws, rel.name);
-      }
-    });
 
-    const wbout = XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
-    
-    setProcessedFiles([{
-        name: '架构全景图_v2.xlsx',
-        blob: new Blob([wbout], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }),
-        preview: defData.slice(0, 10) // Show metadata sheet as preview
-    }]);
+        // ==========================================
+        // FILE 2: Relationship Excel (关系数据.xlsx)
+        // ==========================================
+        const wbRel = XLSX.utils.book_new();
+        const relSheetNames = new Set<string>();
+        
+        // 2.1 "关系定义"
+        // Get unique relationship names from configuration
+        const uniqueRelNames = Array.from(new Set(archModel.relationships.map(r => r.name))).filter(n => n);
+        const relDefData = uniqueRelNames.map(name => ({ "关系名称": name }));
+        
+        if (relDefData.length > 0) {
+            const wsRelDef = XLSX.utils.json_to_sheet(relDefData);
+            XLSX.utils.book_append_sheet(wbRel, wsRelDef, getUniqueSheetName("关系定义", relSheetNames));
+        }
 
-    setStep(4);
+        // 2.2 Relationship Sheets (Aggregated by Name)
+        // Group configured relationships by their Name (e.g., 'Contains' might be configured 3 times: Domain->L1, L1->L2, L2->Cap)
+        const relGroups: Record<string, any[]> = {};
+
+        archModel.relationships.forEach(rel => {
+            if (!rel.name) return;
+
+            // Extract instances for this specific configuration
+            const instances = fileData.data.map((row: ExcelRow) => {
+                const inst: ExcelRow = {};
+                let hasSource = false;
+                let hasTarget = false;
+
+                Object.entries(rel.attributeMapping).forEach(([srcCol, targetAttrRaw]) => {
+                    // Explicit cast to ensure type safety if targetAttrRaw is unknown
+                    const targetAttr = String(targetAttrRaw);
+                    let outKey = targetAttr;
+                    // Enforce headers based on user mapping intent, but allow flexible naming
+                    // If the AI/User mapped it as '源端', 'Source', etc., we normalize it to standard output.
+                    if (['源端', 'Source', 'source', '源', '源端ID'].includes(targetAttr)) {
+                        outKey = '源端主键[必填]';
+                        hasSource = true;
+                    } else if (['目标端', 'Target', 'target', '目标', '目标端ID'].includes(targetAttr)) {
+                        outKey = '目标端主键[必填]';
+                        hasTarget = true;
+                    }
+                    inst[String(outKey)] = (row as any)[String(srcCol)];
+                });
+
+                // Check for data validity
+                // A valid relationship row should have at least some data.
+                // If strict 'Source'/'Target' columns were identified, we prefer them to be present,
+                // but if not identified (e.g. generic link), we just check for any content to avoid empty rows.
+                const hasAnyData = Object.values(inst).some(v => v !== undefined && v !== '' && v !== null);
+
+                // If specific Source/Target columns were identified, check they are not empty
+                const sourceKey = '源端主键[必填]';
+                const targetKey = '目标端主键[必填]';
+                const valSource = inst[sourceKey];
+                const valTarget = inst[targetKey];
+                
+                const sourceValid = !hasSource || (valSource !== undefined && valSource !== '');
+                const targetValid = !hasTarget || (valTarget !== undefined && valTarget !== '');
+
+                return { 
+                    data: inst, 
+                    isValid: hasAnyData && sourceValid && targetValid
+                };
+            }).filter(i => i.isValid).map(i => i.data);
+
+            if (!relGroups[rel.name]) {
+                relGroups[rel.name] = [];
+            }
+            relGroups[rel.name].push(...instances);
+        });
+
+        // Write aggregated sheets
+        Object.entries(relGroups).forEach(([relName, rows]) => {
+            // Dedup rows (source + target combination)
+            const uniqueRows = Array.from(new Set(rows.map(r => JSON.stringify(r)))).map(s => JSON.parse(s));
+            
+            if (uniqueRows.length > 0) {
+                const ws = XLSX.utils.json_to_sheet(uniqueRows);
+                XLSX.utils.book_append_sheet(wbRel, ws, getUniqueSheetName(relName, relSheetNames));
+            }
+        });
+
+        const wbRelOut = XLSX.write(wbRel, { bookType: 'xlsx', type: 'array' });
+        generatedFiles.push({
+            name: '关系数据.xlsx',
+            blob: new Blob([wbRelOut], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }),
+            preview: relDefData
+        });
+
+        setProcessedFiles(generatedFiles);
+        setStep(4);
+    } catch (e) {
+        console.error("Transformation failed:", e);
+        alert("文件生成失败，请检查数据完整性或重试。");
+    }
   }, [fileData, archModel]);
 
 
@@ -609,10 +702,7 @@ const App: React.FC = () => {
                                    <div className="flex justify-between items-center">
                                        <span className="text-slate-500">有效记录</span>
                                        <span className="font-bold text-slate-800">
-                                            {(() => {
-                                                const d = parseDataFromStructure();
-                                                return d ? d.data.length + ' 条' : '...';
-                                            })()}
+                                            {effectiveRecordCount}
                                        </span>
                                    </div>
                                </div>
@@ -649,9 +739,6 @@ const App: React.FC = () => {
                                       onClick={() => {
                                           const d = parseDataFromStructure();
                                           if(d) {
-                                            // Proceed to Goal Input logic within same view or next?
-                                            // The design shows structure analysis. We should proceed to Goal Input.
-                                            // But let's verify data first.
                                             setFileData(d);
                                           }
                                       }}
@@ -668,7 +755,7 @@ const App: React.FC = () => {
                            {fileData && (
                                <div className="mt-4 animate-in slide-in-from-bottom-2 fade-in">
                                    <label className="block text-xs font-bold text-slate-500 uppercase mb-2">
-                                       架构拆分指令 (AI Prompt)
+                                       架构拆分指令 (AI Prompt) <span className="text-orange-500 normal-case ml-2">* 请根据文件实际内容修改示例</span>
                                    </label>
                                    <textarea 
                                         value={userGoal}
@@ -838,7 +925,7 @@ const App: React.FC = () => {
                         <div className="p-4 bg-white">
                             <div className="flex justify-between items-center mb-2">
                                 <span className="text-xs font-bold text-slate-400 uppercase">属性映射 (必须映射到 '源端' 和 '目标端')</span>
-                                <button onClick={() => addMappingToElement(rel.id)} className="text-xs font-bold text-orange-600 hover:underline flex items-center gap-1"><Plus size={12}/> 添加属性</button>
+                                <button onClick={() => addMappingToRel(rel.id)} className="text-xs font-bold text-orange-600 hover:underline flex items-center gap-1"><Plus size={12}/> 添加属性</button>
                             </div>
                             <div className="space-y-2">
                                 {Object.entries(rel.attributeMapping).map(([key, val], mIdx) => (
@@ -893,51 +980,54 @@ const App: React.FC = () => {
              </div>
 
              <div className="flex justify-center mb-8">
-                {processedFiles.map((file, idx) => (
-                    <div key={idx} className="w-full max-w-4xl group bg-white rounded-3xl border border-slate-100 shadow-sm hover:shadow-xl hover:border-indigo-100 transition-all overflow-hidden flex flex-col">
-                        <div className={`p-5 flex items-center justify-between bg-indigo-50/30`}>
-                            <div className="flex items-center gap-3">
-                                <div className={`p-2 rounded-lg bg-indigo-100 text-indigo-600`}>
-                                    <Box size={18} />
+                {processedFiles.map((file, idx) => {
+                    const headers = file.preview && file.preview.length > 0 ? Object.keys(file.preview[0]) : [];
+                    return (
+                        <div key={idx} className="w-full max-w-4xl group bg-white rounded-3xl border border-slate-100 shadow-sm hover:shadow-xl hover:border-indigo-100 transition-all overflow-hidden flex flex-col">
+                            <div className={`p-5 flex items-center justify-between bg-indigo-50/30`}>
+                                <div className="flex items-center gap-3">
+                                    <div className={`p-2 rounded-lg bg-indigo-100 text-indigo-600`}>
+                                        <Box size={18} />
+                                    </div>
+                                    <span className="font-bold text-slate-700">{file.name}</span>
                                 </div>
-                                <span className="font-bold text-slate-700">{file.name} (含“架构元素定义”等多个 Sheet)</span>
+                                <button 
+                                    onClick={() => {
+                                        const url = URL.createObjectURL(file.blob);
+                                        const a = document.createElement('a');
+                                        a.href = url;
+                                        a.download = file.name;
+                                        a.click();
+                                    }}
+                                    className="bg-white p-2 rounded-xl shadow-sm border border-slate-100 hover:text-indigo-600 hover:scale-110 transition-all"
+                                >
+                                    <Download size={18} />
+                                </button>
                             </div>
-                            <button 
-                                onClick={() => {
-                                    const url = URL.createObjectURL(file.blob);
-                                    const a = document.createElement('a');
-                                    a.href = url;
-                                    a.download = file.name;
-                                    a.click();
-                                }}
-                                className="bg-white p-2 rounded-xl shadow-sm border border-slate-100 hover:text-indigo-600 hover:scale-110 transition-all"
-                            >
-                                <Download size={18} />
-                            </button>
-                        </div>
-                        <div className="p-5 flex-1 overflow-auto max-h-80">
-                             <div className="mb-2 text-xs font-bold text-slate-400 uppercase">预览: 架构元素定义 Sheet (前 10 行)</div>
-                             <table className="w-full text-xs text-left border-collapse">
-                                <thead className="text-slate-400 font-bold uppercase tracking-tighter sticky top-0 bg-white">
-                                    <tr>
-                                        {Object.keys((file.preview && file.preview[0]) || {}).map(k => (
-                                            <th key={String(k)} className="pb-2 px-4 border-b border-slate-100">{String(k)}</th>
-                                        ))}
-                                    </tr>
-                                </thead>
-                                <tbody>
-                                    {file.preview.map((row, ri) => (
-                                        <tr key={ri} className="hover:bg-slate-50">
-                                            {Object.values(row || {}).map((val, ci) => (
-                                                <td key={ci} className="py-2 px-4 border-b border-slate-50 text-slate-600">{String(val ?? '')}</td>
+                            <div className="p-5 flex-1 overflow-auto max-h-80">
+                                 <div className="mb-2 text-xs font-bold text-slate-400 uppercase">预览: {idx === 0 ? '架构元素定义' : '关系定义'} Sheet (前 10 行)</div>
+                                 <table className="w-full text-xs text-left border-collapse">
+                                    <thead className="text-slate-400 font-bold uppercase tracking-tighter sticky top-0 bg-white">
+                                        <tr>
+                                            {headers.map((k) => (
+                                                <th key={k} className="pb-2 px-4 border-b border-slate-100">{k}</th>
                                             ))}
                                         </tr>
-                                    ))}
-                                </tbody>
-                             </table>
+                                    </thead>
+                                    <tbody>
+                                        {file.preview?.map((row, ri) => (
+                                            <tr key={ri} className="hover:bg-slate-50">
+                                                {headers.map((h, ci) => (
+                                                    <td key={ci} className="py-2 px-4 border-b border-slate-50 text-slate-600">{String((row as any)[h] ?? '')}</td>
+                                                ))}
+                                            </tr>
+                                        ))}
+                                    </tbody>
+                                 </table>
+                            </div>
                         </div>
-                    </div>
-                ))}
+                    );
+                })}
             </div>
 
             <div className="flex justify-center p-8 gap-4">
@@ -967,7 +1057,7 @@ const App: React.FC = () => {
                     className="bg-slate-900 text-white px-12 py-4 rounded-2xl font-black text-lg shadow-2xl shadow-slate-300 hover:scale-105 active:scale-95 transition-all flex items-center gap-4"
                 >
                     <Download size={24} strokeWidth={3} />
-                    下载架构全景图
+                    下载所有文件
                 </button>
             </div>
         )}
